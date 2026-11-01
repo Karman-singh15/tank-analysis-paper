@@ -1,0 +1,11 @@
+# Point-cloud data (cite the datasets, don't re-host them)
+data/
+
+# Local notes, not part of the repo
+/TASK_LOG.md
+/tunnel/PLAN.md
+
+# Python / macOS
+__pycache__/
+*.pyc
+.DS_Store
