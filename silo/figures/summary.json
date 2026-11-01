@@ -1,0 +1,18 @@
+{
+  "points": 447686,
+  "radius_m": 11.8794,
+  "diameter_m": 23.7588,
+  "height_m": 11.87,
+  "tilt_mm_per_m": 4.88,
+  "lean_over_height_mm": 57.9,
+  "deviation_mm": {
+    "p0.5": -116.3,
+    "p5": -48.4,
+    "p50": -0.3,
+    "p95": 47.9,
+    "p99.5": 105.4
+  },
+  "deviation_std_mm": 30.5,
+  "max_out_of_roundness_pct": 0.991,
+  "coverage_pct_1deg_0.1m": 96.5
+}
