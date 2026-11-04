@@ -52,7 +52,7 @@ def axis_frame(points, axis_pts):
 
 def despike(w, k=DESPIKE_DEG):
     """Circular running median over k bins, NaN-aware; real overbreak spans many degrees, spikes don't."""
-    return np.nanmedian(np.stack([np.roll(w, j) for j in range(-(k // 2), k // 2 + 1)]), 0) if k > 1 else w
+    return np.nanmedian(np.stack([np.roll(w, j, -1) for j in range(-(k // 2), k // 2 + 1)]), 0) if k > 1 else w
 
 
 def wall_profile(u, v):
@@ -169,7 +169,108 @@ def run(points, axis_pts, out):
     for ext in ("png", "pdf"):
         fig.savefig(out / f"sections_vs_design.{ext}", dpi=300)
     plt.close(fig)
+    validation_figure(rows, out)
+    density_figure(s, u, v, rows, out)
     return summary
+
+
+OURS, THEIRS = "#2a78d6", "#eb6834"   # categorical slots 1-2 (dataviz reference palette, CVD-validated)
+
+
+def validation_figure(rows, out):
+    """Ours vs Table 1 for all 34 sections: along the tunnel (top) and 1:1 scatter (bottom)."""
+    D = np.array([r["D_m"] for r in rows])
+    fig, axs = plt.subplots(2, 2, figsize=(12, 9), layout="constrained")
+    for j, (k, name) in enumerate((("M1", "Max over-excavation M1"), ("M2", "Max under-excavation M2"))):
+        ours = np.array([r[k] for r in rows])
+        paper = np.array([0 if x is None else x for x in PAPER[k]], float)
+        ax = axs[0, j]
+        ax.plot(D, paper, "o-", color=THEIRS, lw=2, ms=8, mec="white", mew=1.5, label="Zhang et al. 2022, Table 1")
+        ax.plot(D, ours, "s-", color=OURS, lw=2, ms=8, mec="white", mew=1.5, label="This work")
+        ax.set(xlabel="Chainage D (m)", ylabel=f"{k} (cm)", title=name)
+        ax.legend(frameon=False)
+        ax = axs[1, j]
+        lim = max(ours.max(), paper.max()) * 1.08
+        ax.plot([0, lim], [0, lim], color="0.6", lw=1, ls="--", label="1:1")
+        ax.scatter(paper, ours, s=64, color=OURS, edgecolor="white", linewidth=1.5, zorder=3)
+        txt = f"MAE {np.mean(np.abs(ours - paper)):.1f} cm, all 34 sections"
+        if k == "M1":
+            txt += f"\nr = {np.corrcoef(ours, paper)[0, 1]:.3f}"
+        else:
+            rep = np.array([x is not None for x in PAPER["M2"]])
+            txt += (f"\n{rep.sum()} sections with reported M2: bias {np.mean(ours[rep] - paper[rep]):+.1f} cm,"
+                    f"\ndetected {(ours[rep] >= 1).sum()}/{rep.sum()}, false alarms {(ours[~rep] >= 1).sum()}/{(~rep).sum()}")
+        ax.text(0.04, 0.96, txt, transform=ax.transAxes, va="top", fontsize=9)
+        ax.set(xlim=(-1, lim), ylim=(-1, lim), aspect="equal", xlabel=f"Paper {k} (cm)", ylabel=f"This work {k} (cm)")
+    for ax in axs.flat:
+        ax.grid(color="0.9", lw=0.6)
+        ax.spines[["top", "right"]].set_visible(False)
+    for ext in ("png", "pdf"):
+        fig.savefig(out / f"validation_vs_paper.{ext}", dpi=300)
+    plt.close(fig)
+
+
+def density_figure(s, u, v, rows, out):
+    """C5: error vs point density, by thinning every section and across the sections' natural range."""
+    rng = np.random.default_rng(0)
+    p1 = np.array(PAPER["M1"], float)
+    rep = np.array([x is not None for x in PAPER["M2"]])
+    p2 = np.array([x or 0 for x in PAPER["M2"]], float)
+    secs = [np.where(np.abs(s - D) < HALF_THICK)[0] for D in SECTIONS_M]
+    table = []
+    for keep in (100, 50, 20, 10, 5, 2, 1):
+        res = []
+        for _ in range(1 if keep == 100 else 5):
+            st = []
+            for i in secs:
+                j = i[rng.random(len(i)) < keep / 100]
+                st.append(arc_stats(despike(wall_profile(u[j], v[j])), DESIGN_R))
+            m1, m2 = np.array([x["M1"] for x in st]), np.array([x["M2"] for x in st])
+            res.append((np.nanmean(np.abs(m1 - p1)), np.nanmean(m2[rep] - p2[rep]), int(np.isnan(m1).sum())))
+        table.append((keep, *np.mean(res, 0)))
+        print(f"keep {keep}%: M1 MAE {table[-1][1]:.2f}, M2 bias {table[-1][2]:+.2f}, empty sections {table[-1][3]:.1f}", flush=True)
+    T = np.array(table)
+    np.savetxt(out / "density_robustness.csv", T, delimiter=",", fmt="%.2f", comments="",
+               header="points_kept_pct,M1_mae_cm,M2_bias_reported_sections_cm,empty_sections")
+    fig, ax = plt.subplots(1, 2, figsize=(11, 4), layout="constrained")
+    ax[0].plot(T[:, 0], T[:, 1], "o-", color=OURS, lw=2, ms=8, mec="white", label="M1 error (MAE)")
+    ax[0].plot(T[:, 0], np.abs(T[:, 2]), "s-", color=THEIRS, lw=2, ms=8, mec="white", label="|M2 bias|, 15 reported sections")
+    ax[0].set(xscale="log", xlabel="Points kept (%)", ylabel="cm", ylim=(0, None), title="Thinning every section")
+    ax[0].invert_xaxis()
+    ax[0].legend(frameon=False)
+    n = np.array([r["n_points"] for r in rows], float)
+    ax[1].scatter(n, np.abs(np.array([r["M1"] for r in rows]) - p1), s=64, color=OURS, edgecolor="white", linewidth=1.5)
+    ax[1].set(xscale="log", xlabel="Points in the section", ylabel="|M1 error| (cm)", ylim=(0, None), title="Natural density range")
+    for a_ in ax:
+        a_.grid(color="0.9")
+        a_.spines[["top", "right"]].set_visible(False)
+    for ext in ("png", "pdf"):
+        fig.savefig(out / f"density_robustness.{ext}", dpi=300)
+    plt.close(fig)
+
+
+def unrolled_map(grid_file, out, R=DESIGN_R):
+    """Deviation d = wall - R unrolled along the tunnel (chainage x angle), like the paper's Fig. 1."""
+    g = np.load(grid_file)
+    wall, edges = despike(g["wall"]), g["s_edges"]           # despike along angle, as for the sections
+    ang = np.arange(-ARC_BELOW, 181 + ARC_BELOW)              # evaluated arc, springline-to-springline plus 50 deg
+    d = (wall[:, ang % 360] - R) * 100
+    from matplotlib.colors import LinearSegmentedColormap
+    cmap = LinearSegmentedColormap.from_list("under_over", ["#0d366b", "#5598e7", "#f0efec", "#e66767", "#8f1d1d"])
+    cmap.set_bad("white")
+    fig, ax = plt.subplots(figsize=(14, 4.8), layout="constrained")
+    im = ax.pcolormesh(edges, np.r_[ang - 0.5, ang[-1] + 0.5], d.T, cmap=cmap, vmin=-50, vmax=50, shading="flat",
+                       rasterized=True)
+    ax.vlines(SECTIONS_M, ang[0] - 0.5, ang[-1] + 0.5, color="0.2", lw=0.4, alpha=0.4)
+    ax.set_yticks([-50, 0, 90, 180, 230], ["-50", "0 (right\nspringline)", "90 (crown)", "180 (left\nspringline)", "230"])
+    ax.set(xlabel="Chainage along the design axis (m)", ylabel="Angle (deg)", xlim=(-2, 172),
+           title=f"Unrolled deviation from the design profile (R = {R} m); floor zone 230-310 deg not shown; "
+                 "thin lines = the 34 Table 1 sections")
+    cb = fig.colorbar(im, ax=ax, extend="both", pad=0.01)
+    cb.set_label("d = wall radius - R (cm)\n< 0 under-excavation, > 0 over-excavation")
+    for ext in ("png", "pdf"):
+        fig.savefig(out / f"unrolled_deviation_map.{ext}", dpi=300)
+    plt.close(fig)
 
 
 if __name__ == "__main__":
@@ -179,3 +280,6 @@ if __name__ == "__main__":
     wb = openpyxl.load_workbook(axis_file, read_only=True)
     axis_pts = np.array([r[:3] for r in list(wb.active.iter_rows(values_only=True))[2:]], float)
     print(json.dumps(run(np.load(pts_file), axis_pts, out), indent=2))
+    grid = pts_file.parent / "wall_grid.npz"
+    if grid.exists():
+        unrolled_map(grid, out)
