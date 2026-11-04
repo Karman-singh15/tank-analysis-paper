@@ -12,10 +12,42 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from scipy.optimize import least_squares
+
 from reused import load_point_cloud, correct_yz_alignment, fit_shell_circle_trial9
 
 SLICE_MM = 250.0       # height of each slice used for circle fits
 RNG = np.random.default_rng(0)  # fixed seed: figures are reproducible
+MIN_SLICE_PTS = 500    # slices with fewer points are skipped
+
+
+def lsq_centre(yz, c0, R0):
+    """Plain least-squares circle through all slice points (no balancing, no robust loss)."""
+    f = lambda p: np.hypot(yz[:, 0] - p[0], yz[:, 1] - p[1]) - p[2]
+    return least_squares(f, [c0[0], c0[1], R0]).x[:2]
+
+
+def area_centroid(yz, c0, step=2, it=3):
+    """Centroid of the polygon of median wall radius per `step`-degree bin, re-centred `it` times.
+
+    Every direction counts once, however many points it has, so uneven scan density doesn't pull the centre.
+    Returns the centre and the mean wall radius over all directions.
+    """
+    c = np.asarray(c0, float)
+    tt = np.radians(np.arange(0, 360, step) + step / 2)
+    for _ in range(it):
+        r = np.hypot(yz[:, 0] - c[0], yz[:, 1] - c[1])
+        b = ((np.degrees(np.arctan2(yz[:, 1] - c[1], yz[:, 0] - c[0])) % 360) // step).astype(int)
+        rr = np.array([np.median(r[b == i]) if np.any(b == i) else np.nan for i in range(len(tt))])
+        ok = ~np.isnan(rr)
+        rr = np.interp(tt, tt[ok], rr[ok], period=2 * np.pi)     # bridge scan gaps along the wall, not by a chord
+        x, y = c[0] + rr * np.cos(tt), c[1] + rr * np.sin(tt)
+        x1, y1 = np.roll(x, -1), np.roll(y, -1)
+        cr = x * y1 - x1 * y
+        A = cr.sum() / 2
+        c = np.array([((x + x1) * cr).sum() / (6 * A), ((y + y1) * cr).sum() / (6 * A)])
+    return c, float(rr.mean())
+    # ponytail: gaps are filled by linear interpolation of radius; a dent hidden inside a gap is invisible.
 
 
 def analyse(P):
@@ -23,6 +55,11 @@ def analyse(P):
 
     Returns per-slice fits, the fitted (tilted) axis, and per-point
     cylindrical coordinates (h, theta, rho) and deviation d = rho - R.
+
+    slices columns: h, centre x, centre y, mean wall radius (area centroid; these define the axis and R),
+    reused-fit centre x, y, plain-LSQ centre x, y, reused-fit radius. The area centroid is primary: on a
+    semi-synthetic tank (this scan's deformation and point positions, known axis) its lean error was
+    0.6 mm vs 11 mm (plain LSQ) and 22 mm (reused fit); see centre_study.py.
     """
     # Mill code expects the cylinder axis along X: (X, Y, Z) -> (Z, X, Y).
     pts = P[:, [2, 0, 1]].astype(float)
@@ -37,11 +74,17 @@ def analyse(P):
     edges = np.arange(q[:, 0].min(), q[:, 0].max() + SLICE_MM, SLICE_MM)
     rows = []
     for a, b in zip(edges[:-1], edges[1:]):
-        if np.count_nonzero((q[:, 0] >= a) & (q[:, 0] < b)) < 500:
+        if np.count_nonzero((q[:, 0] >= a) & (q[:, 0] < b)) < MIN_SLICE_PTS:
             continue
+
+        m = (q[:, 0] >= a) & (q[:, 0] < b)
         cy, cz, R = fit_shell_circle_trial9(q, a, b)
-        rows.append((0.5 * (a + b), cy + shift[0], cz + shift[1], R))
+        ly, lz = lsq_centre(q[m, 1:], (cy, cz), R)
+        (ay, az), Rw = area_centroid(q[m, 1:], (cy, cz))
+        rows.append((0.5 * (a + b), ay, az, Rw, cy, cz, ly, lz, R))
     slices = np.array(rows)
+    slices[:, [1, 4, 6]] += shift[0]
+    slices[:, [2, 5, 7]] += shift[1]
 
     # Straight axis through the slice centres -> lean of the shell.
     kx = np.polyfit(slices[:, 0], slices[:, 1], 1)
@@ -196,20 +239,46 @@ def make_figures(P, a, out):
     fig.colorbar(im, ax=ax, label="Points per 1° × 0.1 m cell")
     save(fig, out, "07_coverage")
 
+    # 9. Centre definition: the axis from each method, and how far the reused fit drifts from the centroid.
+    H = np.ptp(a["h"]) / 1000.0
+    methods = (("Area centroid (used)", 1, "#2a78d6", "o"), ("Plain least squares", 6, "#eb6834", "s"),
+               ("Reused mill fit", 4, "#1baf7a", "^"))
+    tilts = {}
+    fig, ax = plt.subplots(1, 3, figsize=(13, 4.5), layout="constrained")
+    for name, i, col, mk in methods:
+        kx_, ky_ = np.polyfit(sl[:, 0], sl[:, i], 1), np.polyfit(sl[:, 0], sl[:, i + 1], 1)
+        tilts[name] = (float(np.hypot(kx_[0], ky_[0]) * 1000), float(np.degrees(np.arctan2(ky_[0], kx_[0]))))
+        for j, (axi, k_) in enumerate(zip(ax[:2], (kx_, ky_))):
+            axi.plot(sl[:, i + j] - np.polyval(k_, sl[0, 0]), hs, mk + "-", color=col, ms=4, lw=1.2,
+                     label=f"{name}: lean {tilts[name][0] * H:.0f} mm")
+    ax[0].set(xlabel="Centre X offset from own axis at bottom (mm)", ylabel="Height (m)", title="Axis, X")
+    ax[1].set(xlabel="Centre Y offset from own axis at bottom (mm)", title="Axis, Y")
+    ax[0].legend(fontsize=7, frameon=False)
+    gap = np.hypot(sl[:, 4] - sl[:, 1], sl[:, 5] - sl[:, 2])
+    ax[2].scatter(ur * 100, gap, s=36, color="#1baf7a", edgecolor="white", linewidth=1)
+    ax[2].set(xlabel="Out-of-roundness of slice (%)", ylabel="Reused fit − area centroid (mm)",
+              title=f"Centre disagreement vs ovality (r = {np.corrcoef(ur, gap)[0, 1]:.2f})")
+    save(fig, out, "09_centre_methods")
+
     # Tables for the paper.
     np.savetxt(out / "slices.csv",
-               np.column_stack([hs, sl[:, 1], sl[:, 2], sl[:, 3], off, ur * 100]),
+               np.column_stack([hs, sl[:, 1], sl[:, 2], sl[:, 3], off, ur * 100, sl[:, 4], sl[:, 5], sl[:, 6], sl[:, 7], sl[:, 8]]),
                delimiter=",", fmt="%.3f",
-               header="height_m,centre_x_mm,centre_y_mm,radius_mm,offset_from_bottom_mm,out_of_roundness_pct",
+               header="height_m,centre_x_mm,centre_y_mm,radius_mm,offset_from_bottom_mm,out_of_roundness_pct,"
+                      "reused_centre_x_mm,reused_centre_y_mm,lsq_centre_x_mm,lsq_centre_y_mm,reused_radius_mm",
                comments="")
     tilt = float(np.hypot(a["kx"][0], a["ky"][0]) * 1000)   # mm per m
     summary = {
         "points": int(len(P)),
         "radius_m": round(a["R"] / 1000, 4),
+        "radius_reused_fit_m": round(float(np.median(a["slices"][:, 8])) / 1000, 4),
         "diameter_m": round(2 * a["R"] / 1000, 4),
         "height_m": round(float(np.ptp(a["h"])) / 1000, 3),
         "tilt_mm_per_m": round(tilt, 2),
         "lean_over_height_mm": round(tilt * float(np.ptp(a["h"])) / 1000, 1),
+        "centre_method": "area centroid",
+        "lean_by_centre_method_mm": {k: dict(tilt_mm_per_m=round(v[0], 2), lean_mm=round(v[0] * H, 1),
+                                             direction_deg=round(v[1])) for k, v in tilts.items()},
         "deviation_mm": {f"p{p}": round(float(np.percentile(a["d"], p)), 1) for p in (0.5, 5, 50, 95, 99.5)},
         "deviation_std_mm": round(float(a["d"].std()), 1),
         "max_out_of_roundness_pct": round(float(np.nanmax(ur)) * 100, 3),

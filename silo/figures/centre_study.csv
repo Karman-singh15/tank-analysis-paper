@@ -1,0 +1,6 @@
+method,"Round tank, real scan positions: median_mm","Round tank, real scan positions: max_mm","Deformed, uniform sampling: median_mm","Deformed, uniform sampling: max_mm","Deformed, real scan positions: median_mm","Deformed, real scan positions: max_mm",real tank lean_mm
+Mill fit as reused (balancing + robust loss),0.1,0.1,13.7,13.9,22.3,22.5,57.9
+"Mill fit, robust loss off",0.1,0.1,0.3,0.6,10.6,10.7,45.0
+"Mill fit, balancing forced on, robust loss off",0.2,0.4,3.5,3.9,13.1,13.4,48.1
+Plain least squares,0.1,0.1,0.3,0.6,10.8,10.8,45.0
+Area centroid (used),0.1,0.2,0.3,0.6,0.6,0.8,36.0

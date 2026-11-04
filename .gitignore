@@ -4,6 +4,7 @@ data/
 # Local notes, not part of the repo
 /TASK_LOG.md
 /tunnel/PLAN.md
+/paper/
 
 # Python / macOS
 __pycache__/

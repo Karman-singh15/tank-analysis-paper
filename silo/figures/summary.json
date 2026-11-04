@@ -1,18 +1,37 @@
 {
   "points": 447686,
-  "radius_m": 11.8794,
-  "diameter_m": 23.7588,
+  "radius_m": 11.8721,
+  "radius_reused_fit_m": 11.8794,
+  "diameter_m": 23.7442,
   "height_m": 11.87,
-  "tilt_mm_per_m": 4.88,
-  "lean_over_height_mm": 57.9,
-  "deviation_mm": {
-    "p0.5": -116.3,
-    "p5": -48.4,
-    "p50": -0.3,
-    "p95": 47.9,
-    "p99.5": 105.4
+  "tilt_mm_per_m": 3.03,
+  "lean_over_height_mm": 36.0,
+  "centre_method": "area centroid",
+  "lean_by_centre_method_mm": {
+    "Area centroid (used)": {
+      "tilt_mm_per_m": 3.03,
+      "lean_mm": 36.0,
+      "direction_deg": 35
+    },
+    "Plain least squares": {
+      "tilt_mm_per_m": 3.79,
+      "lean_mm": 45.0,
+      "direction_deg": 42
+    },
+    "Reused mill fit": {
+      "tilt_mm_per_m": 4.88,
+      "lean_mm": 57.9,
+      "direction_deg": 30
+    }
   },
-  "deviation_std_mm": 30.5,
-  "max_out_of_roundness_pct": 0.991,
-  "coverage_pct_1deg_0.1m": 96.5
+  "deviation_mm": {
+    "p0.5": -102.7,
+    "p5": -37.2,
+    "p50": 7.5,
+    "p95": 60.8,
+    "p99.5": 102.3
+  },
+  "deviation_std_mm": 30.3,
+  "max_out_of_roundness_pct": 0.989,
+  "coverage_pct_1deg_0.1m": 96.4
 }
