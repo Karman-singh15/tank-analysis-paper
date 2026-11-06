@@ -106,6 +106,36 @@ def sensitivity(raw, param, values):
     return res
 
 
+def percentile_profile(u, v, q):
+    """Wall radius per 1 deg bin as a plain percentile, no wall filter."""
+    rho = np.hypot(u, v)
+    b = (np.degrees(np.arctan2(v, u)) % 360).astype(int)
+    w = np.full(360, np.nan)
+    for k in np.unique(b):
+        if np.sum(b == k) >= 3:
+            w[k] = np.percentile(rho[b == k], q)
+    return w
+
+
+def filter_variants(s, u, v):
+    """Does dropping the wall filter close the M2 gap? The source paper's own extraction isn't published, so try the
+    plain alternatives: slab half-thickness x percentile x despike on/off, scored like the main result."""
+    rep = np.array([x is not None for x in PAPER["M2"]])
+    p1, p2 = np.array(PAPER["M1"], float), np.array([x or 0 for x in PAPER["M2"]], float)
+    res = []
+    for half in (0.25, 0.05):
+        secs = [np.abs(s - D) < half for D in SECTIONS_M]
+        for q in (50, 25, 10):
+            raw = [percentile_profile(u[m], v[m], q) for m in secs]
+            for k in (DESPIKE_DEG, 1):
+                st = [arc_stats(despike(w, k), DESIGN_R) for w in raw]
+                m1, m2 = np.array([x["M1"] for x in st]), np.array([x["M2"] for x in st])
+                res.append(dict(slab_half_m=half, percentile=q, despike_deg=k, detected=int((m2[rep] >= 1).sum()),
+                                false_alarms=int((m2[~rep] >= 1).sum()), M2_bias_cm=round(float(np.mean(m2[rep] - p2[rep])), 1),
+                                M1_mae_cm=round(float(np.mean(np.abs(m1 - p1))), 1)))
+    return res
+
+
 def run(points, axis_pts, out):
     out.mkdir(parents=True, exist_ok=True)
     s, u, v = axis_frame(points, axis_pts)
@@ -146,6 +176,7 @@ def run(points, axis_pts, out):
         fitted_centre_vs_design_axis_mm=dict(median=round(float(np.median(offs))), max=round(float(offs.max()))),
         arc_sensitivity_mae_cm_M1_M2=sensitivity(raw, "arc", range(40, 61, 5)),
         despike_sensitivity_mae_cm_M1_M2=sensitivity(raw, "despike", (1, 3, 5, 7, 9)),
+        M2_without_wall_filter=filter_variants(s, u, v),
     )
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
 

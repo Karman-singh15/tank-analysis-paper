@@ -12,13 +12,19 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from scipy.ndimage import median_filter
 from scipy.optimize import least_squares
 
 from reused import load_point_cloud, correct_yz_alignment, fit_shell_circle_trial9
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tunnel"))
+from tunnel_validation import wall_profile, despike
+
 SLICE_MM = 250.0       # height of each slice used for circle fits
 RNG = np.random.default_rng(0)  # fixed seed: figures are reproducible
 MIN_SLICE_PTS = 500    # slices with fewer points are skipped
+# Doubled wall: residuals here have two peaks ~25 mm apart (-20, +5), so two scans disagree; see scan_quality().
+DOUBLED_AZ, DOUBLED_MIN_H, DOUBLED_SPLIT = (125, 145), 3.3, -7.5   # deg, m above lowest point, mm
 
 
 def lsq_centre(yz, c0, R0):
@@ -27,20 +33,33 @@ def lsq_centre(yz, c0, R0):
     return least_squares(f, [c0[0], c0[1], R0]).x[:2]
 
 
-def area_centroid(yz, c0, step=2, it=3):
+def direction_radii(yz, c, step=2):
+    """Median wall radius per `step`-degree direction about c; scan gaps bridged along the wall, not by a chord."""
+    tt = np.radians(np.arange(0, 360, step) + step / 2)
+    r = np.hypot(yz[:, 0] - c[0], yz[:, 1] - c[1])
+    b = ((np.degrees(np.arctan2(yz[:, 1] - c[1], yz[:, 0] - c[0])) % 360) // step).astype(int)
+    rr = np.array([np.median(r[b == i]) if np.any(b == i) else np.nan for i in range(len(tt))])
+    ok = ~np.isnan(rr)
+    return tt, np.interp(tt, tt[ok], rr[ok], period=2 * np.pi)
+
+
+def tunnel_wall_radii(yz, c, step=2):
+    """direction_radii with the tunnel's exact wall rule (filter, 1 deg bins, 5 deg despike); `step` is ignored."""
+    tt = np.radians(np.arange(360) + 0.5)
+    w = despike(wall_profile((yz[:, 0] - c[0]) / 1000.0, (yz[:, 1] - c[1]) / 1000.0)) * 1000.0
+    ok = ~np.isnan(w)
+    return tt, np.interp(tt, tt[ok], w[ok], period=2 * np.pi)
+
+
+def area_centroid(yz, c0, step=2, it=3, radii=direction_radii):
     """Centroid of the polygon of median wall radius per `step`-degree bin, re-centred `it` times.
 
     Every direction counts once, however many points it has, so uneven scan density doesn't pull the centre.
     Returns the centre and the mean wall radius over all directions.
     """
     c = np.asarray(c0, float)
-    tt = np.radians(np.arange(0, 360, step) + step / 2)
     for _ in range(it):
-        r = np.hypot(yz[:, 0] - c[0], yz[:, 1] - c[1])
-        b = ((np.degrees(np.arctan2(yz[:, 1] - c[1], yz[:, 0] - c[0])) % 360) // step).astype(int)
-        rr = np.array([np.median(r[b == i]) if np.any(b == i) else np.nan for i in range(len(tt))])
-        ok = ~np.isnan(rr)
-        rr = np.interp(tt, tt[ok], rr[ok], period=2 * np.pi)     # bridge scan gaps along the wall, not by a chord
+        tt, rr = radii(yz, c, step)
         x, y = c[0] + rr * np.cos(tt), c[1] + rr * np.sin(tt)
         x1, y1 = np.roll(x, -1), np.roll(y, -1)
         cr = x * y1 - x1 * y
@@ -50,7 +69,7 @@ def area_centroid(yz, c0, step=2, it=3):
     # ponytail: gaps are filled by linear interpolation of radius; a dent hidden inside a gap is invisible.
 
 
-def analyse(P):
+def analyse(P, radii=direction_radii):
     """P: (n, 3) points in mm, silo axis roughly along Z.
 
     Returns per-slice fits, the fitted (tilted) axis, and per-point
@@ -80,7 +99,7 @@ def analyse(P):
         m = (q[:, 0] >= a) & (q[:, 0] < b)
         cy, cz, R = fit_shell_circle_trial9(q, a, b)
         ly, lz = lsq_centre(q[m, 1:], (cy, cz), R)
-        (ay, az), Rw = area_centroid(q[m, 1:], (cy, cz))
+        (ay, az), Rw = area_centroid(q[m, 1:], (cy, cz), radii=radii)
         rows.append((0.5 * (a + b), ay, az, Rw, cy, cz, ly, lz, R))
     slices = np.array(rows)
     slices[:, [1, 4, 6]] += shift[0]
@@ -117,6 +136,83 @@ def grid_mean(theta, h, v, t_step=1.0, h_step=100.0):
     c, _, _ = np.histogram2d(theta, h, bins=(t_edges, h_edges))
     with np.errstate(invalid="ignore"):
         return (s / c).T, c.T, t_edges, h_edges
+
+
+def harmonics(m, Hc, bands=((0, 3), (3, 6), (6, 9), (9, 12)), n_max=6):
+    """Amplitude (mm) of each wall harmonic, from the mean deviation per direction in each height band (m)."""
+    i, t = np.arange(360), np.radians(np.arange(360) + 0.5)
+    res = {}
+    for lo, hi in bands:
+        r = np.nanmean(m[(Hc >= lo) & (Hc < hi)], 0)
+        ok = ~np.isnan(r)
+        r = np.interp(i, i[ok], r[ok], period=360)
+        res[f"{lo}-{hi} m"] = {f"n{n}": round(float(2 * abs(np.mean(r * np.exp(-1j * n * t)))), 1) for n in range(1, n_max + 1)}
+    return res
+
+
+def first_harmonic_left(P, a):
+    """n = 1 amplitude (mm) of each slice's equal-weight wall radii about each method's own centre.
+
+    The area centroid zeroes this to first order, which is why it matches the test tanks' "no n = 1" truth.
+    """
+    sl = a["slices"]
+    amp = {k: [] for k in ("area_centroid", "plain_lsq", "mill_fit")}
+    for row in sl:
+        yz = P[np.abs(a["h"] - row[0]) < SLICE_MM / 2, :2]
+        for k, i in zip(amp, (1, 6, 4)):
+            tt, rr = direction_radii(yz, row[i:i + 2])
+            amp[k].append(2 * abs(np.mean(rr * np.exp(-1j * tt))))
+    return {k: dict(median=round(float(np.median(v)), 2), max=round(float(np.max(v)), 2)) for k, v in amp.items()}
+
+
+def scan_quality(P, a, m, c, he, out):
+    """Can the scan itself be trusted? Within-cell spread map, doubled-wall patch, and what that patch does to the results."""
+    h0 = a["h"].min()
+    H = (a["h"] - h0) / 1000.0
+    sq, _, _, _ = grid_mean(a["theta"], a["h"], a["d"] ** 2)
+    sd = np.where(c >= 4, np.sqrt(np.maximum(sq - m ** 2, 0)), np.nan)
+    # Residual from a smoothed wall, so the shape itself isn't counted as spread.
+    smooth = median_filter(np.where(np.isnan(m), np.nanmedian(m), m), size=(11, 7), mode="wrap")
+    res = a["d"] - smooth[np.clip(np.searchsorted(he, a["h"]) - 1, 0, len(smooth) - 1), a["theta"].astype(int) % 360]
+    patch = (a["theta"] >= DOUBLED_AZ[0]) & (a["theta"] < DOUBLED_AZ[1]) & (H >= DOUBLED_MIN_H)
+    near = (a["theta"] >= 150) & (a["theta"] < 180) & (H >= DOUBLED_MIN_H)
+
+    def result(b):
+        tilt = float(np.hypot(b["kx"][0], b["ky"][0]))
+        return dict(tilt_mm_per_m=round(tilt * 1000, 2), lean_mm=round(tilt * float(np.ptp(b["h"])), 2), radius_m=round(b["R"] / 1000, 4))
+
+    Hc = (he[:-1] - h0) / 1000.0
+    in_patch = (Hc >= DOUBLED_MIN_H)[:, None] & (np.arange(360) >= DOUBLED_AZ[0]) & (np.arange(360) < DOUBLED_AZ[1])
+    col_dev, col_n = np.nanmean(m, 0), c.sum(0)
+    ok = ~np.isnan(col_dev) & (col_n > 0)
+
+    fig, ax = plt.subplots(1, 2, figsize=(13, 4), width_ratios=(2, 1), layout="constrained")
+    im = ax[0].imshow(sd, origin="lower", aspect="auto", cmap="magma", vmin=0, vmax=20,
+                      extent=[0, 360, 0, (he[-1] - h0) / 1000.0], interpolation="nearest")
+    ax[0].set(xlabel="Azimuth θ (°)", ylabel="Height (m)", title="Spread of points within a wall cell", xticks=range(0, 361, 45))
+    ax[0].grid(False)
+    fig.colorbar(im, ax=ax[0], label="Standard deviation per 1° × 0.1 m cell (mm)", extend="max")
+    bins = np.arange(-50, 51, 5)
+    ax[1].hist(res[near], bins=bins, density=True, color="#2a78d6", alpha=0.8, label=f"Neighbouring wall, 150–180° (sd {res[near].std():.0f} mm)")
+    ax[1].hist(res[patch], bins=bins, density=True, histtype="step", lw=2, color="#eb6834",
+               label=f"Doubled patch, {DOUBLED_AZ[0]}–{DOUBLED_AZ[1]}° (sd {res[patch].std():.0f} mm)")
+    ax[1].set(xlabel="Point minus smoothed wall (mm)", ylabel="Density", title="Two surfaces in the patch")
+    ax[1].legend(frameon=False, fontsize=7, loc="upper left")
+    save(fig, out, "13_scan_quality")
+
+    b = analyse(P, tunnel_wall_radii)   # does the tank result depend on which wall rule is used?
+    shift = float(np.hypot(b["kx"][0] - a["kx"][0], b["ky"][0] - a["ky"][0]) * np.ptp(a["h"]))
+
+    return dict(
+        tunnel_wall_rule=dict(result(b), lean_vector_shift_mm=round(shift, 2)),
+        within_cell_sd_mm=dict(whole_wall_median=round(float(np.nanmedian(sd)), 1), doubled_patch_median=round(float(np.nanmedian(sd[in_patch])), 1)),
+        density_vs_deviation_r_by_azimuth=round(float(np.corrcoef(np.log(col_n[ok]), col_dev[ok])[0, 1]), 2),
+        doubled_patch=dict(azimuth_deg=DOUBLED_AZ, min_height_m=DOUBLED_MIN_H, points=int(patch.sum()),
+                           points_pct=round(100 * float(patch.mean()), 1),
+                           inner_surface_only=result(analyse(P[~(patch & (res >= DOUBLED_SPLIT))])),
+                           outer_surface_only=result(analyse(P[~(patch & (res < DOUBLED_SPLIT))])),
+                           removed=result(analyse(P[~patch]))),
+    )
 
 
 def save(fig, out, name):
@@ -210,12 +306,13 @@ def make_figures(P, a, out):
     ax[2].set(xlabel="Out-of-roundness (Dmax−Dmin)/D (%)", title="Out-of-roundness")
     save(fig, out, "04_vertical_profiles")
 
-    # 5. Deviation histogram.
+    # 5. Deviation histogram. Each wall cell counts once, so densely scanned areas don't dominate.
+    cells = m[~np.isnan(m)]
     fig, ax = plt.subplots(figsize=(5, 3.5))
-    ax.hist(a["d"], bins=200, range=(-2 * lim, 2 * lim), color="C0")
+    ax.hist(cells, bins=100, range=(-2 * lim, 2 * lim), color="C0")
     for p in (5, 50, 95):
-        ax.axvline(np.percentile(a["d"], p), color="k", lw=0.8, ls=":" if p != 50 else "-")
-    ax.set(xlabel="Deviation (mm)", ylabel="Points", title="Distribution of wall deviation")
+        ax.axvline(np.percentile(cells, p), color="k", lw=0.8, ls=":" if p != 50 else "-")
+    ax.set(xlabel="Deviation (mm)", ylabel="Wall cells (1° × 0.1 m)", title="Distribution of wall deviation")
     save(fig, out, "05_deviation_histogram")
 
     # 6. 3D view coloured by deviation.
@@ -268,6 +365,7 @@ def make_figures(P, a, out):
                       "reused_centre_x_mm,reused_centre_y_mm,lsq_centre_x_mm,lsq_centre_y_mm,reused_radius_mm",
                comments="")
     tilt = float(np.hypot(a["kx"][0], a["ky"][0]) * 1000)   # mm per m
+    pct = lambda v: {f"p{p}": round(float(np.percentile(v, p)), 1) for p in (0.5, 5, 50, 95, 99.5)}
     summary = {
         "points": int(len(P)),
         "radius_m": round(a["R"] / 1000, 4),
@@ -279,10 +377,16 @@ def make_figures(P, a, out):
         "centre_method": "area centroid",
         "lean_by_centre_method_mm": {k: dict(tilt_mm_per_m=round(v[0], 2), lean_mm=round(v[0] * H, 1),
                                              direction_deg=round(v[1])) for k, v in tilts.items()},
-        "deviation_mm": {f"p{p}": round(float(np.percentile(a["d"], p)), 1) for p in (0.5, 5, 50, 95, 99.5)},
-        "deviation_std_mm": round(float(a["d"].std()), 1),
+        "deviation_mm": pct(cells),                 # per 1 deg x 0.1 m wall cell
+        "deviation_std_mm": round(float(cells.std()), 1),
+        "deviation_per_point_mm": pct(a["d"]),      # for comparison only: densely scanned areas dominate
+        "deviation_per_point_std_mm": round(float(a["d"].std()), 1),
+        "radius_slope_mm_per_m": round(float(np.polyfit(hs, sl[:, 3], 1)[0]), 2),
+        "harmonic_amplitude_mm": harmonics(m, (he[:-1] - h0) / 1000.0),
+        "first_harmonic_left_mm": first_harmonic_left(P, a),
         "max_out_of_roundness_pct": round(float(np.nanmax(ur)) * 100, 3),
         "coverage_pct_1deg_0.1m": round(float((c > 0).mean()) * 100, 1),
+        "scan_quality": scan_quality(P, a, m, c, he, out),
     }
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
     return summary
